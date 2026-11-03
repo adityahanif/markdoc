@@ -1,27 +1,348 @@
-/* Markdoc app: file handling, worker management, output rendering.
-   Conversion itself happens in worker.js (Pyodide + MarkItDown). */
+/* Markdoc app: queue UI plus the JavaScript conversion engine.
+   Every library loads lazily from ./vendor/ on this same origin,
+   the first time a file of that kind is converted. */
 (function () {
-  "use strict";
+  'use strict';
 
-  var SUPPORTED = {
-    pdf: "application/pdf",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    xls: "application/vnd.ms-excel",
-    html: "text/html",
-    htm: "text/html",
-    epub: "application/epub+zip",
-    csv: "text/csv",
-    txt: "text/plain",
-    md: "text/markdown",
-    markdown: "text/markdown",
-    json: "application/json",
-    xml: "application/xml",
-    ipynb: "application/x-ipynb+json"
-  };
+  /* ------------------------------------------------ engine */
+  var VENDOR = 'vendor/';
+  var scriptCache = {};
+  function loadScript(name) {
+    if (!scriptCache[name]) {
+      scriptCache[name] = new Promise(function (resolve, reject) {
+        var s = document.createElement('script');
+        s.src = VENDOR + name;
+        s.onload = resolve;
+        s.onerror = function () { reject(new Error('Could not load ' + name)); };
+        document.head.appendChild(s);
+      });
+    }
+    return scriptCache[name];
+  }
+
+  var tdPromise = null;
+  function getTurndown() {
+    if (!tdPromise) {
+      tdPromise = Promise.all([loadScript('turndown.js'), loadScript('turndown-plugin-gfm.js')]).then(function () {
+        var td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced', bulletListMarker: '-' });
+        td.use(turndownPluginGfm.gfm);
+        return td;
+      });
+    }
+    return tdPromise;
+  }
+
+  function escCell(s) {
+    return String(s == null ? '' : s).replace(/\|/g, '\\|').replace(/\s*\n\s*/g, ' ');
+  }
+  function rowsToTable(rows) {
+    if (!rows.length) return '';
+    var width = 0;
+    rows.forEach(function (r) { width = Math.max(width, r.length); });
+    var norm = rows.map(function (r) {
+      var c = r.slice();
+      while (c.length < width) c.push('');
+      return c;
+    });
+    var out = ['| ' + norm[0].map(escCell).join(' | ') + ' |',
+               '| ' + norm[0].map(function () { return '---'; }).join(' | ') + ' |'];
+    for (var i = 1; i < norm.length; i++) out.push('| ' + norm[i].map(escCell).join(' | ') + ' |');
+    return out.join('\n');
+  }
+  function parseCsv(text) {
+    var rows = [], row = [], cell = '', inQ = false;
+    for (var i = 0; i < text.length; i++) {
+      var c = text[i];
+      if (inQ) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { cell += '"'; i++; } else inQ = false;
+        } else cell += c;
+      } else if (c === '"') inQ = true;
+      else if (c === ',') { row.push(cell); cell = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && text[i + 1] === '\n') i++;
+        row.push(cell); cell = '';
+        if (row.length > 1 || row[0] !== '') rows.push(row);
+        row = [];
+      } else cell += c;
+    }
+    row.push(cell);
+    if (row.length > 1 || row[0] !== '') rows.push(row);
+    return rows;
+  }
+  function byTag(root, local) {
+    return Array.prototype.slice.call(root.getElementsByTagNameNS('*', local));
+  }
+  function parseXml(text) {
+    return new DOMParser().parseFromString(text, 'text/xml');
+  }
+
+  /* --- DOCX: mammoth to HTML, then Turndown. Tables get a real
+         header row first, because mammoth emits td-only tables. */
+  function fixDocxTables(html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    Array.prototype.slice.call(doc.querySelectorAll('table')).forEach(function (t) {
+      var firstRow = t.querySelector('tr');
+      if (firstRow) {
+        firstRow.querySelectorAll('td').forEach(function (td) {
+          var th = doc.createElement('th');
+          th.innerHTML = td.innerHTML;
+          td.replaceWith(th);
+        });
+        var thead = doc.createElement('thead');
+        t.insertBefore(thead, t.firstChild);
+        thead.appendChild(firstRow);
+      }
+      t.querySelectorAll('td p, th p').forEach(function (p) {
+        p.replaceWith.apply(p, Array.prototype.slice.call(p.childNodes));
+      });
+    });
+    return doc.body.innerHTML;
+  }
+  function convertDocx(file) {
+    return Promise.all([loadScript('mammoth.browser.min.js'), getTurndown()]).then(function (vals) {
+      var td = vals[1];
+      return file.arrayBuffer().then(function (buf) {
+        return mammoth.convertToHtml({ arrayBuffer: buf }, {
+          convertImage: mammoth.images.imgElement(function () {
+            return Promise.resolve({ src: '' });
+          })
+        });
+      }).then(function (result) {
+        var cleaned = result.value.replace(/<img[^>]*src=""[^>]*>/g, '');
+        return td.turndown(fixDocxTables(cleaned)).trim();
+      });
+    });
+  }
+
+  /* --- XLSX / XLS: SheetJS straight to Markdown tables. */
+  function convertSheet(file) {
+    return loadScript('xlsx.full.min.js').then(function () {
+      return file.arrayBuffer();
+    }).then(function (buf) {
+      var wb = XLSX.read(buf, { type: 'array' });
+      var parts = [];
+      wb.SheetNames.forEach(function (name) {
+        var rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: '' });
+        var clean = rows.filter(function (r) { return r.some(function (c) { return c !== ''; }); });
+        if (!clean.length) return;
+        if (wb.SheetNames.length > 1) parts.push('## ' + name);
+        parts.push(rowsToTable(clean.map(function (r) {
+          return r.map(function (c) { return String(c); });
+        })));
+      });
+      return parts.join('\n\n').trim();
+    });
+  }
+
+  /* --- PDF: pdf.js text items grouped into lines by position,
+         then lines joined into paragraphs by vertical spacing,
+         so wrapped lines merge the way MarkItDown never did. */
+  function convertPdf(file) {
+    return loadScript('pdf.min.js').then(function () {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = VENDOR + 'pdf.worker.min.js';
+      return file.arrayBuffer();
+    }).then(function (buf) {
+      return pdfjsLib.getDocument({ data: buf }).promise;
+    }).then(function (pdf) {
+      var pages = [];
+      var chain = Promise.resolve();
+      for (var p = 1; p <= pdf.numPages; p++) {
+        (function (pageNum) {
+          chain = chain.then(function () {
+            return pdf.getPage(pageNum);
+          }).then(function (page) {
+            return page.getTextContent();
+          }).then(function (tc) {
+            pages.push(pdfPageToMarkdown(tc.items));
+          });
+        })(p);
+      }
+      return chain.then(function () { return pages.join('\n\n').trim(); });
+    });
+  }
+  function pdfPageToMarkdown(items) {
+    var linesMap = new Map();
+    items.forEach(function (item) {
+      if (!item.str) return;
+      var y = Math.round(item.transform[5]);
+      if (!linesMap.has(y)) linesMap.set(y, []);
+      linesMap.get(y).push({ x: item.transform[4], str: item.str, h: item.height || 10 });
+    });
+    var lines = Array.from(linesMap.entries()).sort(function (a, b) { return b[0] - a[0]; })
+      .map(function (entry) {
+        var parts = entry[1].sort(function (a, b) { return a.x - b.x; });
+        return {
+          y: entry[0],
+          h: parts[0].h,
+          text: parts.map(function (i) { return i.str; }).join(' ').replace(/\s+/g, ' ').trim()
+        };
+      }).filter(function (l) { return l.text; });
+    var paragraphs = [], current = '', paraH = 0;
+    lines.forEach(function (line, idx) {
+      if (!current) { current = line.text; paraH = line.h; return; }
+      var prev = lines[idx - 1];
+      var gap = prev.y - line.y;
+      var fontChanged = paraH > 0 && Math.abs(line.h - paraH) / paraH > 0.3;
+      if (!fontChanged && gap <= prev.h * 1.45) {
+        if (/[A-Za-z]-$/.test(current) && /^[a-z]/.test(line.text)) {
+          current = current.slice(0, -1) + line.text;
+        } else {
+          current += ' ' + line.text;
+        }
+      } else {
+        paragraphs.push(current);
+        current = line.text;
+        paraH = line.h;
+      }
+    });
+    if (current) paragraphs.push(current);
+    return paragraphs.join('\n\n');
+  }
+
+  /* --- PPTX: own parser. ZIP, then slide XML in order.
+         Title placeholder becomes a heading, tables become
+         Markdown tables, other paragraphs become lines. */
+  function convertPptx(file) {
+    return loadScript('jszip.min.js').then(function () {
+      return file.arrayBuffer();
+    }).then(function (buf) {
+      return JSZip.loadAsync(buf);
+    }).then(function (zip) {
+      var slideNames = Object.keys(zip.files)
+        .filter(function (n) { return /^ppt\/slides\/slide\d+\.xml$/.test(n); })
+        .sort(function (a, b) {
+          return parseInt(a.match(/(\d+)\.xml$/)[1], 10) - parseInt(b.match(/(\d+)\.xml$/)[1], 10);
+        });
+      var out = [];
+      var chain = Promise.resolve();
+      slideNames.forEach(function (name, idx) {
+        chain = chain.then(function () {
+          return zip.file(name).async('string');
+        }).then(function (xml) {
+          var md = pptxSlideToMarkdown(parseXml(xml), idx + 1);
+          if (md) out.push(md);
+        });
+      });
+      return chain.then(function () { return out.join('\n\n').trim(); });
+    });
+  }
+  function pptxSlideToMarkdown(doc, num) {
+    var parts = ['<!-- Slide number: ' + num + ' -->'];
+    var spTree = byTag(doc, 'spTree')[0];
+    if (!spTree) return '';
+    Array.prototype.slice.call(spTree.children).forEach(function (node) {
+      if (node.localName === 'sp') {
+        var ph = byTag(node, 'ph')[0];
+        var type = ph ? (ph.getAttribute('type') || 'body') : 'body';
+        var paras = byTag(node, 'p').map(function (p) {
+          return byTag(p, 't').map(function (t) { return t.textContent; }).join('');
+        }).filter(function (s) { return s.trim(); });
+        if (!paras.length) return;
+        if (type === 'title' || type === 'ctrTitle') {
+          parts.push('# ' + paras.join(' '));
+        } else {
+          paras.forEach(function (s) { parts.push(s); });
+        }
+      } else if (node.localName === 'graphicFrame') {
+        var rows = byTag(node, 'tr').map(function (tr) {
+          return byTag(tr, 'tc').map(function (tc) {
+            return byTag(tc, 't').map(function (t) { return t.textContent; }).join('');
+          });
+        }).filter(function (r) { return r.length; });
+        if (rows.length) parts.push(rowsToTable(rows));
+      }
+    });
+    return parts.length > 1 ? parts.join('\n\n') : '';
+  }
+
+  /* --- EPUB: own parser. container.xml to the OPF, then walk
+         the spine and Turndown each chapter document. */
+  function convertEpub(file) {
+    return Promise.all([loadScript('jszip.min.js'), getTurndown()]).then(function (vals) {
+      var td = vals[1];
+      return file.arrayBuffer().then(function (buf) {
+        return JSZip.loadAsync(buf);
+      }).then(function (zip) {
+        return zip.file('META-INF/container.xml').async('string').then(function (container) {
+          var rootfile = byTag(parseXml(container), 'rootfile')[0].getAttribute('full-path');
+          var base = rootfile.indexOf('/') >= 0 ? rootfile.slice(0, rootfile.lastIndexOf('/') + 1) : '';
+          return zip.file(rootfile).async('string').then(function (opfText) {
+            var opf = parseXml(opfText);
+            var titleEl = byTag(opf, 'title')[0];
+            var manifest = {};
+            byTag(opf, 'item').forEach(function (item) {
+              manifest[item.getAttribute('id')] = item.getAttribute('href');
+            });
+            var spine = byTag(opf, 'itemref').map(function (ref) {
+              return manifest[ref.getAttribute('idref')];
+            }).filter(Boolean);
+            var parts = [];
+            if (titleEl && titleEl.textContent.trim()) parts.push('# ' + titleEl.textContent.trim());
+            var chain = Promise.resolve();
+            spine.forEach(function (href) {
+              var entry = zip.file(base + href);
+              if (!entry) return;
+              chain = chain.then(function () { return entry.async('string'); })
+                .then(function (html) {
+                  var doc = new DOMParser().parseFromString(html, 'text/html');
+                  if (doc.body) {
+                    var md = td.turndown(doc.body.innerHTML).trim();
+                    if (md) parts.push(md);
+                  }
+                });
+            });
+            return chain.then(function () { return parts.join('\n\n').trim(); });
+          });
+        });
+      });
+    });
+  }
+
+  /* --- IPYNB: plain JSON. Markdown cells pass through, code
+         cells become fenced blocks, outputs are skipped. */
+  function convertIpynb(file) {
+    return file.text().then(function (text) {
+      var nb = JSON.parse(text);
+      var lang = (nb.metadata && nb.metadata.language_info && nb.metadata.language_info.name) || 'python';
+      var parts = [];
+      (nb.cells || []).forEach(function (cell) {
+        var src = Array.isArray(cell.source) ? cell.source.join('') : (cell.source || '');
+        if (!src.trim()) return;
+        if (cell.cell_type === 'code') parts.push('```' + lang + '\n' + src.replace(/\n$/, '') + '\n```');
+        else parts.push(src.trim());
+      });
+      return parts.join('\n\n').trim();
+    });
+  }
+
+  function convertHtml(file) {
+    return getTurndown().then(function (td) {
+      return file.text().then(function (text) {
+        var doc = new DOMParser().parseFromString(text, 'text/html');
+        return td.turndown(doc.body ? doc.body.innerHTML : text).trim();
+      });
+    });
+  }
+
+  function convertFile(file) {
+    var ext = (file.name.split('.').pop() || '').toLowerCase();
+    switch (ext) {
+      case 'docx': return convertDocx(file);
+      case 'xlsx': case 'xls': return convertSheet(file);
+      case 'pdf': return convertPdf(file);
+      case 'pptx': return convertPptx(file);
+      case 'epub': return convertEpub(file);
+      case 'ipynb': return convertIpynb(file);
+      case 'html': case 'htm': return convertHtml(file);
+      case 'csv': return file.text().then(function (t) { return rowsToTable(parseCsv(t)).trim(); });
+      default: return file.text().then(function (t) { return t.trim(); });
+    }
+  }
+  var SUPPORTED = ['pdf', 'docx', 'pptx', 'xlsx', 'xls', 'html', 'htm', 'epub', 'csv', 'txt', 'md', 'markdown', 'json', 'xml', 'ipynb'];
+
+  /* ------------------------------------------------ UI */
   var MAX_BYTES = 50 * 1024 * 1024;
-
   var dropzone = document.getElementById("dropzone");
   var fileInput = document.getElementById("file-input");
   var fileList = document.getElementById("file-list");
@@ -47,79 +368,10 @@
   var viewMode = "raw";
   var selectedId = null;
 
-  /* ---------------- Worker management ---------------- */
-  var worker = null;
-  var workerReady = false;
-  var workerFailed = false;
-  var seq = 0;
-  var pending = new Map();
-
   function setEngine(text) { engineEl.textContent = text; }
   function setStatus(text, isError) {
     statusEl.textContent = text;
     statusEl.classList.toggle("is-error", !!isError);
-  }
-
-  function createWorker() {
-    workerReady = false;
-    workerFailed = false;
-    worker = new Worker("./worker.js?v=1");
-    worker.onmessage = function (event) {
-      var m = event.data || {};
-      if (m.type === "progress") {
-        setEngine(m.detail || m.stage);
-        if (busy) setStatus(m.detail || m.stage, false);
-      } else if (m.type === "ready") {
-        workerReady = true;
-        setEngine("siap (MarkItDown 0.1.9 di Pyodide)");
-      } else if (m.type === "fatal") {
-        workerFailed = true;
-        setEngine("gagal dimuat. Periksa koneksi lalu coba tambahkan file lagi.");
-        setStatus("Mesin gagal dimuat: " + m.error, true);
-      } else if (m.type === "result") {
-        workerReady = true;
-        var p = pending.get(m.id);
-        if (p) { pending.delete(m.id); p.resolve(m.markdown); }
-      } else if (m.type === "error") {
-        var q = pending.get(m.id);
-        if (q) { pending.delete(m.id); q.reject(new Error(m.error)); }
-      }
-    };
-    worker.onerror = function () {
-      workerFailed = true;
-      setEngine("worker bermasalah. Muat ulang halaman untuk mencoba lagi.");
-    };
-    return worker;
-  }
-
-  function ensureWorker() {
-    if (!worker || workerFailed) createWorker();
-    return worker;
-  }
-
-  function warmup() {
-    var w = ensureWorker();
-    if (!workerReady && !workerFailed) {
-      setEngine("sedang disiapkan…");
-      w.postMessage({ type: "warmup" });
-    }
-  }
-
-  function convertWithWorker(entry) {
-    var w = ensureWorker();
-    return entry.file.arrayBuffer().then(function (buf) {
-      return new Promise(function (resolve, reject) {
-        var id = ++seq;
-        pending.set(id, { resolve: resolve, reject: reject });
-        w.postMessage({
-          type: "convert",
-          id: id,
-          filename: entry.file.name,
-          mimetype: entry.file.type || SUPPORTED[entry.ext] || "",
-          bytes: new Uint8Array(buf)
-        });
-      });
-    });
   }
 
   /* ---------------- File list ---------------- */
@@ -129,14 +381,14 @@
   }
   function formatSize(bytes) {
     if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1).replace(".", ",") + " KB";
-    return (bytes / (1024 * 1024)).toFixed(1).replace(".", ",") + " MB";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   }
   var STATUS_TEXT = {
-    queued: "menunggu",
-    converting: "mengonversi…",
-    done: "selesai",
-    error: "gagal"
+    queued: "waiting",
+    converting: "converting…",
+    done: "done",
+    error: "failed"
   };
 
   function renderList() {
@@ -152,12 +404,12 @@
       size.textContent = formatSize(entry.file.size);
       var st = document.createElement("span");
       st.className = "file-status" + (entry.status === "done" ? " is-done" : entry.status === "error" ? " is-error" : "");
-      st.textContent = entry.status === "error" ? ("gagal: " + entry.error) : STATUS_TEXT[entry.status];
+      st.textContent = entry.status === "error" ? ("failed: " + entry.error) : STATUS_TEXT[entry.status];
       st.title = entry.status === "error" ? entry.error : "";
       var rm = document.createElement("button");
       rm.type = "button";
       rm.className = "file-remove";
-      rm.textContent = "hapus";
+      rm.textContent = "remove";
       rm.disabled = busy;
       rm.addEventListener("click", function () {
         entries = entries.filter(function (e) { return e.id !== entry.id; });
@@ -176,7 +428,7 @@
   }
 
   function addFiles(fileArray) {
-    if (busy) { setStatus("Tunggu konversi yang berjalan selesai dulu.", false); return; }
+    if (busy) { setStatus("Wait for the conversion in progress to finish first.", false); return; }
     var added = 0;
     Array.prototype.forEach.call(fileArray, function (file) {
       var ext = extOf(file.name);
@@ -184,15 +436,15 @@
         id: nextId++, file: file, name: file.name, ext: ext,
         status: "queued", markdown: null, error: ""
       };
-      if (!SUPPORTED.hasOwnProperty(ext)) {
+      if (SUPPORTED.indexOf(ext) < 0) {
         entry.status = "error";
-        entry.error = "format ." + (ext || "?") + " tidak didukung";
+        entry.error = "format ." + (ext || "?") + " is not supported";
       } else if (file.size > MAX_BYTES) {
         entry.status = "error";
-        entry.error = "file lebih besar dari 50 MB";
+        entry.error = "file is larger than 50 MB";
       } else if (file.size === 0) {
         entry.status = "error";
-        entry.error = "file kosong";
+        entry.error = "file is empty";
       } else {
         added++;
       }
@@ -200,10 +452,9 @@
     });
     renderList(); refreshButtons();
     if (added > 0) {
-      setStatus(added + " file siap dikonversi. Mesin sedang disiapkan di latar belakang.", false);
-      warmup();
+      setStatus(added + (added === 1 ? " file ready" : " files ready") + " to convert.", false);
     } else {
-      setStatus("Tidak ada file valid yang ditambahkan. Cek format dan ukuran file.", true);
+      setStatus("No valid files were added. Check the format and size.", true);
     }
   }
 
@@ -228,7 +479,7 @@
   clearBtn.addEventListener("click", function () {
     entries = []; selectedId = null;
     renderList(); renderOutput(); refreshButtons();
-    setStatus("Daftar file dibersihkan.", false);
+    setStatus("File list cleared.", false);
   });
 
   /* ---------------- Conversion ---------------- */
@@ -241,8 +492,8 @@
       chain = chain.then(function () {
         entry.status = "converting"; entry.error = "";
         renderList();
-        setStatus("Mengonversi " + entry.name + "…", false);
-        return convertWithWorker(entry).then(function (markdown) {
+        setStatus("Converting " + entry.name + "…", false);
+        return convertFile(entry.file).then(function (markdown) {
           entry.status = "done";
           entry.markdown = markdown;
           selectedId = entry.id;
@@ -254,19 +505,17 @@
     });
     chain.then(function () {
       busy = false; refreshButtons(); renderList(); renderOutput();
-      if (workerReady) setEngine("siap (MarkItDown 0.1.9 di Pyodide)");
+      setEngine("ready");
       var done = entries.filter(function (e) { return e.status === "done"; }).length;
       var failed = entries.filter(function (e) { return e.status === "error"; }).length;
-      if (failed === 0) setStatus("Selesai. " + done + " file berhasil dikonversi.", false);
-      else setStatus("Selesai dengan catatan: " + done + " berhasil, " + failed + " gagal. File yang gagal bisa dicoba lagi dengan tombol Convert.", failed > 0 && done === 0);
+      if (failed === 0) setStatus("Done. " + done + (done === 1 ? " file" : " files") + " converted.", false);
+      else setStatus("Finished with issues: " + done + " converted, " + failed + " failed. Failed files can be retried with the Convert button.", failed > 0 && done === 0);
     });
   });
 
   function shortenError(err) {
     var msg = String(err && err.message ? err.message : err);
-    if (/MissingDependencyException/.test(msg)) return "dependensi format ini tidak tersedia di build browser";
-    if (/UnsupportedFormatException/.test(msg)) return "format tidak didukung MarkItDown";
-    if (/FileConversionException/.test(msg)) return "MarkItDown gagal membaca file ini";
+    if (/Invalid PDF/i.test(msg)) return "this PDF could not be read";
     if (msg.length > 110) msg = msg.slice(0, 110) + "…";
     return msg;
   }
@@ -303,7 +552,7 @@
     outputPreview.innerHTML = renderMarkdown(entry.markdown);
     var chars = entry.markdown.length;
     var words = entry.markdown.trim() ? entry.markdown.trim().split(/\s+/).length : 0;
-    outputMeta.textContent = chars.toLocaleString("id-ID") + " karakter, " + words.toLocaleString("id-ID") + " kata";
+    outputMeta.textContent = chars.toLocaleString("en-US") + " characters, " + words.toLocaleString("en-US") + " words";
     applyViewMode();
   }
 
@@ -326,7 +575,7 @@
   copyBtn.addEventListener("click", function () {
     var entry = selectedEntry();
     if (!entry) return;
-    function ok() { copyBtn.textContent = "Tersalin"; setTimeout(function () { copyBtn.textContent = "Salin Markdown"; }, 1600); }
+    function ok() { copyBtn.textContent = "Copied"; setTimeout(function () { copyBtn.textContent = "Copy Markdown"; }, 1600); }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(entry.markdown).then(ok, function () { fallbackCopy(entry.markdown); ok(); });
     } else { fallbackCopy(entry.markdown); ok(); }

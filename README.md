@@ -1,68 +1,43 @@
 # Markdoc
 
-Convert dokumen ke Markdown langsung di browser, tanpa upload.
+Convert documents to Markdown, entirely in your browser. No uploads: files are read locally and never leave the device.
 
-Markdoc menjalankan library **MarkItDown** asli dari Microsoft (Python, versi 0.1.9) di dalam browser memakai **Pyodide** (CPython yang dikompilasi ke WebAssembly). File yang dipilih pengguna dibaca lewat File API dan dikonversi di Web Worker pada tab yang sama. Dokumen tidak pernah dikirim ke server mana pun.
+**Live:** https://adityahanif.github.io/markdoc/
 
-Live: https://adityahanif.github.io/markdoc/
+## How it works
 
-## Format yang didukung
+Markdoc is a static site (vanilla HTML, CSS, and JS, no build step). Each format is converted by a JavaScript library or a small built-in parser, loaded lazily from the `vendor/` folder on this same origin the first time that format is used. Nothing is fetched from a CDN, and document contents are never sent anywhere.
 
-Sudah diuji end-to-end di browser dengan file contoh nyata:
-
-| Format | Ekstensi |
+| Format | Engine |
 | --- | --- |
-| PDF teks | .pdf |
-| Word | .docx |
-| PowerPoint | .pptx |
-| Excel | .xlsx, .xls |
-| Web dan e-book | .html, .htm, .epub |
-| Teks dan data | .csv, .txt, .md, .json, .xml |
-| Notebook | .ipynb |
+| .docx | Mammoth 1.13 to HTML, then Turndown 7 (GFM). Tables get a real header row, because mammoth emits td-only tables. |
+| .xlsx, .xls | SheetJS 0.18.5, one Markdown table per sheet. |
+| .pdf | pdf.js 3.11 text extraction. Lines are grouped by position, then joined into paragraphs by line spacing and font size, so wrapped lines merge back into sentences. Hyphenated line breaks are rejoined too. |
+| .pptx | Built-in parser: JSZip opens the file, slide XML is read in order; titles become headings, tables become Markdown tables. Speaker notes and diagram text are not extracted. |
+| .epub | Built-in parser: JSZip plus the OPF spine; each chapter document goes through Turndown, and the book title becomes the top heading. |
+| .html, .htm | Turndown (GFM). |
+| .csv | Built-in CSV parser to a Markdown table. |
+| .ipynb | Built-in JSON parser: Markdown cells pass through, code cells become fenced blocks, outputs are skipped. |
+| .txt, .md, .markdown, .json, .xml | Passed through as plain text. |
 
-Belum didukung di build browser ini:
+File size limit: 50 MB per file. Multiple files can be queued and converted in sequence.
 
-- PDF hasil scan dan OCR gambar (butuh model/tool di luar WebAssembly)
-- Transkripsi audio dan deskripsi gambar otomatis
-- Tabel PDF kompleks bisa kurang rapi, karena jalur pdfplumber tidak tersedia di browser (lihat catatan teknis)
+## Not supported
 
-## Cara kerja
+Scanned PDFs and image OCR, audio transcription, and embedded images (images inside documents are skipped). PDF tables come out as plain text lines, not Markdown tables.
 
-1. Pengguna memilih atau menjatuhkan file. File dibaca sebagai ArrayBuffer lalu diteruskan ke `worker.js` lewat `postMessage`.
-2. Worker memuat Pyodide dari CDN, memasang MarkItDown dan dependensinya dari PyPI dengan micropip, lalu mengonversi file dengan `MarkItDown.convert_stream()`.
-3. Hasil Markdown ditampilkan sebagai teks mentah di panel graphite atau sebagai pratinjau, lalu bisa disalin atau diunduh sebagai `.md`.
+## Development
 
-Pandas dan openpyxl untuk file spreadsheet dimuat terpisah, hanya saat file `.xlsx`/`.xls` pertama dikonversi, supaya load awal lebih ringan.
+Everything is static. Serve the folder with any web server, for example:
 
-Yang diunduh browser pada pemakaian pertama hanyalah kode (runtime Pyodide dari CDN jsDelivr dan wheel Python dari PyPI), totalnya puluhan megabyte, dan tersimpan di cache browser untuk kunjungan berikutnya.
+    python3 -m http.server
 
-## Catatan teknis: dua stub kecil
+Then bump the `?v=` query on the stylesheet and script tags in `index.html` whenever `style.css` or `app.js` changes, so GitHub Pages visitors skip stale caches. The vendored libraries in `vendor/` are loaded with plain script tags (no bundler): mammoth.browser.min.js, turndown.js, turndown-plugin-gfm.js, xlsx.full.min.js, pdf.min.js and pdf.worker.min.js, jszip.min.js.
 
-Dua dependensi MarkItDown tidak punya build WebAssembly, jadi `worker.js` memasang stub sebelum MarkItDown diimpor:
+## History
 
-- **magika** (deteksi tipe file berbasis onnxruntime). Markdoc selalu meneruskan ekstensi, nama file, dan mimetype secara eksplisit lewat `StreamInfo`, jadi stub cukup melaporkan "unknown": MarkItDown akan memakai tebakan dari ekstensi/mimetype, dan pemilihan converter tetap tepat.
-- **pdfplumber** (butuh binary pypdfium2). Stub membuat `open()` langsung gagal, sehingga PdfConverter memakai jalur fallback resminya sendiri, yaitu pdfminer.six. Hasil PDF teks tetap sama; ekstraksi tabel terstruktur dari PDF yang biasanya ditangani pdfplumber tidak ikut.
+The first version of Markdoc (2026-11-03) ran Microsoft MarkItDown 0.1.9 in the browser via Pyodide and WebAssembly. It worked, but the first load was tens of megabytes and took a long while. The JavaScript build replaced it the same day: output quality matched or beat the Python build on the formats tested (DOCX, PDF, XLSX, HTML, CSV compared side by side), at roughly 800 KB of libraries in total, loaded per format on demand.
 
-Converter spreadsheet mencatat ketiadaan pandas/openpyxl saat modul diimpor, jadi setelah pandas dipasang, `worker.js` memuat ulang modul `markitdown` dan membangun ulang converter (`markdoc_reload_converter()`).
+## License
 
-## Menjalankan lokal
-
-Cukup server statis biasa:
-
-```bash
-python3 -m http.server 8000
-# buka http://localhost:8000
-```
-
-Tidak ada proses build. Semua file adalah HTML/CSS/JS vanilla.
-
-## Struktur
-
-- `index.html` — halaman dan panel converter
-- `style.css`, `tokens.css`, `base.css` — gaya (tema Hallmark Cobalt)
-- `app.js` — logika UI, antrean file, salin/unduh, pratinjau Markdown
-- `worker.js` — worker Pyodide + MarkItDown, termasuk kedua stub di atas
-
-## Lisensi
-
-Kode situs ini MIT. MarkItDown adalah proyek Microsoft berlisensi MIT; Pyodide berlisensi MPL-2.0.
+Site code: MIT. Vendored libraries keep their own licenses (Mammoth BSD-2, Turndown MIT, SheetJS Apache-2.0, pdf.js Apache-2.0, JSZip MIT).

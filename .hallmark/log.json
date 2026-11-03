@@ -12,5 +12,19 @@
   "prompt": "Markdoc document converter to markdown, MarkItDown only, in browser, no upload",
   "date": "2026-11-03",
   "mode": "build"
+ },
+ {
+  "shape": "Workbench",
+  "theme": "cobalt",
+  "genre": "modern-minimal",
+  "job": "try",
+  "hero": "Banner workbench",
+  "nav": "banner bar",
+  "footer": "statement",
+  "imagery": "none",
+  "signature": "live converter workbench",
+  "prompt": "Markdoc v2: JavaScript engine (Mammoth, SheetJS, pdf.js, Turndown, built-in PPTX/EPUB/IPYNB parsers), English UI, no upload",
+  "date": "2026-11-03",
+  "mode": "redesign"
  }
 ]
