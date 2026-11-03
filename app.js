@@ -164,7 +164,7 @@
   function pdfPageToMarkdown(items) {
     var linesMap = new Map();
     items.forEach(function (item) {
-      if (!item.str) return;
+      if (!item.str || !item.str.trim()) return;
       var y = Math.round(item.transform[5]);
       if (!linesMap.has(y)) linesMap.set(y, []);
       linesMap.get(y).push({
@@ -182,18 +182,129 @@
           h: parts[0].h,
           x0: parts[0].x,
           x1: Math.max.apply(null, parts.map(function (p) { return p.end; })),
+          parts: parts,
+          cells: pdfSplitCells(parts),
           text: parts.map(function (i) { return i.str; }).join(' ').replace(/\s+/g, ' ').trim()
         };
       }).filter(function (l) { return l.text; });
     if (!lines.length) return '';
     lines.forEach(function (l) { l.w = Math.max(0, l.x1 - l.x0); });
 
+    /* Split the page into text segments and tables. A run of at
+       least two lines whose items split into two or more cells at
+       wide horizontal gaps is a table candidate; the candidate
+       only becomes a table when its cells line up on shared
+       column anchors, so ordinary justified prose, whose word
+       gaps land at random positions, falls back to text. */
+    var blocks = [], textRun = [], i = 0;
+    function flushText() {
+      if (textRun.length) {
+        var md = pdfLinesToParagraphs(textRun);
+        if (md) blocks.push(md);
+        textRun = [];
+      }
+    }
+    while (i < lines.length) {
+      if (lines[i].cells.length >= 2) {
+        var run = [];
+        while (i < lines.length && lines[i].cells.length >= 2) { run.push(lines[i]); i++; }
+        var table = pdfBuildTable(run);
+        if (table) { flushText(); blocks.push(table); }
+        else textRun = textRun.concat(run);
+      } else {
+        textRun.push(lines[i]);
+        i++;
+      }
+    }
+    flushText();
+    return blocks.join('\n\n');
+  }
+
+  function pdfSplitCells(parts) {
+    var cells = [], cur = null;
+    parts.forEach(function (p) {
+      if (!cur) { cur = { x: p.x, end: p.end, text: p.str }; return; }
+      var gap = p.x - cur.end;
+      if (gap > Math.max(10, p.h || 10)) {
+        cells.push(cur);
+        cur = { x: p.x, end: p.end, text: p.str };
+      } else {
+        cur.text += ' ' + p.str;
+        cur.end = Math.max(cur.end, p.end);
+      }
+    });
+    if (cur) cells.push(cur);
+    cells.forEach(function (c) { c.text = c.text.replace(/\s+/g, ' ').trim(); });
+    return cells;
+  }
+
+  function pdfBuildTable(run) {
+    if (run.length < 2) return null;
+    var anchors = [];
+    run.forEach(function (line) {
+      line.cells.forEach(function (c) { anchors.push(c.x); });
+    });
+    anchors.sort(function (a, b) { return a - b; });
+    var cols = [];
+    anchors.forEach(function (x) {
+      if (!cols.length || x - cols[cols.length - 1] > 6) cols.push(x);
+    });
+    if (cols.length < 2 || cols.length > 12) return null;
+    /* Strong columns are anchors used by at least two rows. A real
+       table reuses its column starts; prose does not. */
+    var colUse = cols.map(function () { return 0; });
+    run.forEach(function (line) {
+      var seen = {};
+      line.cells.forEach(function (c) {
+        var idx = pdfColumnIndex(cols, c.x);
+        if (idx >= 0) seen[idx] = true;
+      });
+      Object.keys(seen).forEach(function (k) { colUse[Number(k)]++; });
+    });
+    var strong = cols.filter(function (_, idx) { return colUse[idx] >= 2; });
+    if (strong.length < 2) return null;
+    var rowsOk = 0;
+    var grid = run.map(function (line) {
+      var row = strong.map(function () { return ''; });
+      var filled = {};
+      line.cells.forEach(function (c) {
+        var idx = pdfColumnIndex(strong, c.x);
+        if (idx < 0) idx = 0;
+        row[idx] = row[idx] ? row[idx] + ' ' + c.text : c.text;
+        filled[idx] = true;
+      });
+      if (Object.keys(filled).length >= 2) rowsOk++;
+      return row;
+    });
+    if (rowsOk < Math.ceil(run.length * 0.7)) return null;
+    /* Two-column prose (journal layout) also aligns on anchors;
+       its cells are long sentences, table cells are short. */
+    var words = 0, cellCount = 0;
+    grid.forEach(function (row) {
+      row.forEach(function (c) {
+        if (c) { words += c.split(/\s+/).length; cellCount++; }
+      });
+    });
+    if (strong.length === 2 && cellCount && words / cellCount > 6) return null;
+    return rowsToTable(grid);
+  }
+
+  function pdfColumnIndex(cols, x) {
+    var idx = -1;
+    for (var i = 0; i < cols.length; i++) {
+      if (cols[i] <= x + 6) idx = i;
+      else break;
+    }
+    return idx;
+  }
+
+  function pdfLinesToParagraphs(lines) {
     /* Paragraph detection adapts to the document itself, because
        line spacing varies too much between PDF producers for one
        fixed threshold. Signals, strongest first:
        1. the font size changes (a heading starts),
-       2. the vertical gap is much larger than this page's typical
-          line gap (the median of all gaps),
+       2. the vertical gap is much larger than this segment's
+          typical line gap (the median of all gaps),
        3. the previous line is short, so it ended a paragraph even
           when the spacing is perfectly uniform,
        4. this line starts indented, a first-line paragraph indent. */

@@ -110,7 +110,7 @@
             <tr><th scope="col">Format</th><th scope="col">Extensions</th><th scope="col">Powered by</th></tr>
           </thead>
           <tbody>
-            <tr><td>PDF text</td><td class="mono">.pdf</td><td>pdf.js extraction, wrapped lines joined into paragraphs</td></tr>
+            <tr><td>PDF text</td><td class="mono">.pdf</td><td>pdf.js extraction, paragraphs joined, simple tables detected</td></tr>
             <tr><td>Word</td><td class="mono">.docx</td><td>Mammoth plus Turndown</td></tr>
             <tr><td>PowerPoint</td><td class="mono">.pptx</td><td>Built-in parser (JSZip and slide XML)</td></tr>
             <tr><td>Excel</td><td class="mono">.xlsx, .xls</td><td>SheetJS</td></tr>
@@ -120,7 +120,7 @@
           </tbody>
         </table>
       </div>
-      <p class="section-note">Not supported: scanned PDFs and image OCR, audio transcription, and embedded images. Images inside documents are skipped, and PDF tables come out as plain lines rather than Markdown tables.</p>
+      <p class="section-note">Not supported: scanned PDFs and image OCR, audio transcription, and embedded images. Images inside documents are skipped. Simple PDF tables are detected from text positions; tables with wrapped cell text may still come out as lines.</p>
     </div>
   </section>
 
@@ -139,7 +139,7 @@
         </div>
         <div class="faq-item">
           <h3>Which browsers work?</h3>
-          <p>Any modern browser: Chrome, Edge, Firefox, or a recent Safari. It works on phones too; the first conversion takes a moment longer.</p>
+          <p>Any modern browser: Chrome, Edge, Firefox, or a recent Safari. It also works on phones.</p>
         </div>
       </div>
     </div>
@@ -153,6 +153,6 @@
       </div>
 </footer>
 
-<script src="./app.js?v=3"></script>
+<script src="./app.js?v=4"></script>
 </body>
 </html>
