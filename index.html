@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markdoc: Convert dokumen ke Markdown di browser</title>
+<meta name="description" content="Markdoc mengonversi PDF, DOCX, PPTX, XLSX, dan format lain ke Markdown memakai MarkItDown dari Microsoft, langsung di browser. File tidak pernah meninggalkan perangkat.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./style.css?v=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232457d6'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="site-nav">
+  <div class="container nav-row">
+    <a class="wordmark" href="./">Markdoc</a>
+    <nav class="nav-links" aria-label="Utama">
+      <a href="#format">Format</a>
+      <a href="#cara-kerja">Cara kerja</a>
+      <a href="#privasi">Privasi</a>
+      <a href="https://github.com/adityahanif/markdoc">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <canvas id="field" aria-hidden="true"></canvas>
+    <div class="container hero-grid">
+      <div class="hero-copy">
+        <h1>Dokumen jadi Markdown, tanpa upload.</h1>
+        <p class="lead">MarkItDown dari Microsoft, jalan di browser kamu. Pilih file, convert, unduh Markdown-nya.</p>
+        <p class="hero-formats">PDF, Word, PowerPoint, Excel, HTML, EPUB, dan teks</p>
+        <p class="engine-line">Mesin: <span id="engine-status">belum dimuat, akan disiapkan saat file pertama ditambahkan</span></p>
+      </div>
+
+      <div class="workbench cut" id="workbench">
+        <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Pilih atau jatuhkan file untuk dikonversi">
+          <p class="drop-title">Jatuhkan file di sini</p>
+          <p class="drop-sub">atau</p>
+          <button type="button" class="key key--ghost" id="pick-btn">Pilih file</button>
+          <p class="drop-note">Bisa banyak file sekaligus. Maksimal 50 MB per file.</p>
+          <input type="file" id="file-input" multiple hidden
+            accept=".pdf,.docx,.pptx,.xlsx,.xls,.html,.htm,.epub,.csv,.txt,.md,.markdown,.json,.xml,.ipynb">
+        </div>
+
+        <ul class="file-list" id="file-list" aria-label="File yang akan dikonversi"></ul>
+
+        <div class="workbench-actions">
+          <button type="button" class="key key--primary" id="convert-btn" disabled>Convert ke Markdown</button>
+          <button type="button" class="key" id="clear-btn" disabled>Bersihkan</button>
+        </div>
+        <p class="workbench-status" id="workbench-status" aria-live="polite">Tambahkan file untuk mulai. Load pertama mengunduh runtime Python dan library, jadi butuh waktu lebih lama.</p>
+
+        <div class="output" id="output" hidden>
+          <div class="output-head">
+            <label class="output-label" for="output-select">Hasil</label>
+            <select id="output-select"></select>
+            <div class="view-toggle" role="group" aria-label="Mode tampilan hasil">
+              <button type="button" class="key key--small is-active" id="view-raw">Mentah</button>
+              <button type="button" class="key key--small" id="view-preview">Pratinjau</button>
+            </div>
+          </div>
+          <div class="graphite output-body">
+            <pre id="output-raw"><code id="output-code"></code></pre>
+            <div id="output-preview" class="preview" hidden></div>
+          </div>
+          <div class="output-actions">
+            <button type="button" class="key" id="copy-btn">Salin Markdown</button>
+            <button type="button" class="key" id="download-btn">Unduh .md</button>
+            <span class="output-meta" id="output-meta"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="cara-kerja">
+    <div class="container">
+      <h2>File dibaca browser, Python yang bekerja</h2>
+      <div class="steps">
+        <div class="step cut">
+          <p class="step-num figure">1</p>
+          <h3>Browser membaca file</h3>
+          <p>File yang kamu pilih dibaca lewat File API dan diteruskan ke worker di tab yang sama. Tidak ada request berisi dokumen ke server mana pun.</p>
+        </div>
+        <div class="step cut">
+          <p class="step-num figure">2</p>
+          <h3>MarkItDown jalan di WebAssembly</h3>
+          <p>Di dalam worker, Pyodide menjalankan CPython dan library MarkItDown asli, versi 0.1.9, sama seperti yang kamu pasang lewat pip.</p>
+        </div>
+        <div class="step cut">
+          <p class="step-num figure">3</p>
+          <h3>Hasil tinggal diambil</h3>
+          <p>Markdown tampil di panel graphite. Salin ke clipboard atau unduh sebagai file .md, lalu pakai untuk LLM, catatan, atau dokumentasi.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="format">
+    <div class="container">
+      <h2>Format yang didukung</h2>
+      <p class="section-lead">Daftar ini hanya berisi format yang sudah diuji jalan di build browser ini.</p>
+      <div class="table-wrap cut">
+        <table>
+          <thead>
+            <tr><th scope="col">Format</th><th scope="col">Ekstensi</th><th scope="col">Mesin di baliknya</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>PDF teks</td><td class="mono">.pdf</td><td>PdfConverter MarkItDown lewat pdfminer.six</td></tr>
+            <tr><td>Word</td><td class="mono">.docx</td><td>DocxConverter lewat Mammoth</td></tr>
+            <tr><td>PowerPoint</td><td class="mono">.pptx</td><td>PptxConverter</td></tr>
+            <tr><td>Excel</td><td class="mono">.xlsx, .xls</td><td>XlsxConverter lewat pandas dan openpyxl</td></tr>
+            <tr><td>Web dan e-book</td><td class="mono">.html, .htm, .epub</td><td>HtmlConverter dan EpubConverter</td></tr>
+            <tr><td>Teks dan data</td><td class="mono">.csv, .txt, .md, .json, .xml</td><td>Converter teks dan CsvConverter</td></tr>
+            <tr><td>Notebook</td><td class="mono">.ipynb</td><td>IpynbConverter</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="section-note">Belum didukung di build browser ini: PDF hasil scan, OCR gambar, transkripsi audio, dan deskripsi gambar otomatis, karena ketiganya butuh model tambahan di luar WebAssembly. Tabel PDF kompleks juga bisa kurang rapi tanpa jalur pdfplumber.</p>
+    </div>
+  </section>
+
+  <section class="section" id="privasi">
+    <div class="container">
+      <h2>Dokumenmu tidak ke mana-mana</h2>
+      <p class="section-lead">Yang diunduh browser saat pertama kali memakai Markdoc hanyalah kode: runtime Pyodide dari CDN dan wheel Python dari PyPI. Isi dokumen tidak terkirim, tidak disimpan, dan hilang dari memori saat tab ditutup. Cek sendiri lewat tab Network di DevTools.</p>
+      <div class="faq">
+        <div class="faq-item">
+          <h3>Kenapa load pertama lama?</h3>
+          <p>Browser perlu mengunduh interpreter Python versi WebAssembly beserta library MarkItDown, totalnya puluhan megabyte. Kunjungan berikutnya lebih cepat karena file-file itu tersimpan di cache browser. File spreadsheet memuat pandas secara terpisah saat pertama kali dibutuhkan.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Apakah hasil convert-nya sama dengan MarkItDown di pip?</h3>
+          <p>Sama untuk format yang didukung, karena yang berjalan memang library yang sama. Dua pengecualian kecil: deteksi tipe file mengikuti ekstensi yang kamu berikan, dan PDF memakai jalur pdfminer, bukan pdfplumber.</p>
+        </div>
+        <div class="faq-item">
+          <h3>Browser apa yang dibutuhkan?</h3>
+          <p>Browser modern dengan WebAssembly dan Web Worker, misalnya Chrome, Edge, Firefox, atau Safari versi terbaru. Di ponsel bisa, hanya saja load pertama lebih terasa.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p class="footer-statement">Markdoc. Dokumen jadi Markdown, tetap di perangkatmu.</p>
+    <p class="footer-meta">Dibangun dengan <a href="https://github.com/microsoft/markitdown">MarkItDown</a> (Microsoft, MIT) dan <a href="https://pyodide.org">Pyodide</a>. Kode sumber di <a href="https://github.com/adityahanif/markdoc">GitHub</a>.</p>
+      </div>
+</footer>
+
+<script src="./app.js?v=1"></script>
+</body>
+</html>

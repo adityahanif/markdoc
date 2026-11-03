@@ -1,0 +1,16 @@
+[
+ {
+  "shape": "Workbench",
+  "theme": "cobalt",
+  "genre": "modern-minimal",
+  "job": "try",
+  "hero": "Banner workbench",
+  "nav": "banner bar",
+  "footer": "statement",
+  "imagery": "none",
+  "signature": "live MarkItDown workbench",
+  "prompt": "Markdoc document converter to markdown, MarkItDown only, in browser, no upload",
+  "date": "2026-11-03",
+  "mode": "build"
+ }
+]
