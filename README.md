@@ -12,7 +12,7 @@ Markdoc is a static site (vanilla HTML, CSS, and JS, no build step). Each format
 | --- | --- |
 | .docx | Mammoth 1.13 to HTML, then Turndown 7 (GFM). Tables get a real header row, because mammoth emits td-only tables. |
 | .xlsx, .xls | SheetJS 0.18.5, one Markdown table per sheet. |
-| .pdf | pdf.js 3.11 text extraction. Lines are grouped by position, then joined into paragraphs by line spacing and font size, so wrapped lines merge back into sentences. Hyphenated line breaks are rejoined too. |
+| .pdf | pdf.js 3.11 text extraction. Lines are grouped by position, then joined into paragraphs adaptively: the page median line gap, short paragraph-ending lines, first-line indents, and font size changes are the signals, so wrapped lines merge back into sentences even in loosely spaced documents. Hyphenated line breaks are rejoined too. |
 | .pptx | Built-in parser: JSZip opens the file, slide XML is read in order; titles become headings, tables become Markdown tables. Speaker notes and diagram text are not extracted. |
 | .epub | Built-in parser: JSZip plus the OPF spine; each chapter document goes through Turndown, and the book title becomes the top heading. |
 | .html, .htm | Turndown (GFM). |

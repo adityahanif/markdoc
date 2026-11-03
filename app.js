@@ -167,7 +167,12 @@
       if (!item.str) return;
       var y = Math.round(item.transform[5]);
       if (!linesMap.has(y)) linesMap.set(y, []);
-      linesMap.get(y).push({ x: item.transform[4], str: item.str, h: item.height || 10 });
+      linesMap.get(y).push({
+        x: item.transform[4],
+        end: item.transform[4] + (item.width || 0),
+        str: item.str,
+        h: item.height || 10
+      });
     });
     var lines = Array.from(linesMap.entries()).sort(function (a, b) { return b[0] - a[0]; })
       .map(function (entry) {
@@ -175,16 +180,43 @@
         return {
           y: entry[0],
           h: parts[0].h,
+          x0: parts[0].x,
+          x1: Math.max.apply(null, parts.map(function (p) { return p.end; })),
           text: parts.map(function (i) { return i.str; }).join(' ').replace(/\s+/g, ' ').trim()
         };
       }).filter(function (l) { return l.text; });
-    var paragraphs = [], current = '', paraH = 0;
-    lines.forEach(function (line, idx) {
-      if (!current) { current = line.text; paraH = line.h; return; }
-      var prev = lines[idx - 1];
-      var gap = prev.y - line.y;
+    if (!lines.length) return '';
+    lines.forEach(function (l) { l.w = Math.max(0, l.x1 - l.x0); });
+
+    /* Paragraph detection adapts to the document itself, because
+       line spacing varies too much between PDF producers for one
+       fixed threshold. Signals, strongest first:
+       1. the font size changes (a heading starts),
+       2. the vertical gap is much larger than this page's typical
+          line gap (the median of all gaps),
+       3. the previous line is short, so it ended a paragraph even
+          when the spacing is perfectly uniform,
+       4. this line starts indented, a first-line paragraph indent. */
+    var gaps = [];
+    for (var i = 1; i < lines.length; i++) {
+      var g = lines[i - 1].y - lines[i].y;
+      if (g > 0) gaps.push(g);
+    }
+    gaps.sort(function (a, b) { return a - b; });
+    var medGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+    var widths = lines.map(function (l) { return l.w; }).sort(function (a, b) { return a - b; });
+    var fullW = widths.length ? widths[Math.floor(widths.length * 0.8)] : 0;
+    var leftEdge = Math.min.apply(null, lines.map(function (l) { return l.x0; }));
+
+    var paragraphs = [], current = '', paraH = 0, prevLine = null;
+    lines.forEach(function (line) {
+      if (!current) { current = line.text; paraH = line.h; prevLine = line; return; }
+      var gap = prevLine.y - line.y;
       var fontChanged = paraH > 0 && Math.abs(line.h - paraH) / paraH > 0.3;
-      if (!fontChanged && gap <= prev.h * 1.45) {
+      var gapBreak = medGap > 0 && gap > medGap * 1.4;
+      var shortBreak = fullW > 0 && prevLine.w < fullW * 0.82 && line.x0 <= leftEdge + fullW * 0.08;
+      var indentBreak = fullW > 0 && (line.x0 - prevLine.x0) > fullW * 0.04 && (line.x0 - prevLine.x0) < fullW * 0.3;
+      if (!fontChanged && !gapBreak && !shortBreak && !indentBreak) {
         if (/[A-Za-z]-$/.test(current) && /^[a-z]/.test(line.text)) {
           current = current.slice(0, -1) + line.text;
         } else {
@@ -195,6 +227,7 @@
         current = line.text;
         paraH = line.h;
       }
+      prevLine = line;
     });
     if (current) paragraphs.push(current);
     return paragraphs.join('\n\n');
