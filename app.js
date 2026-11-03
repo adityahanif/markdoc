@@ -135,9 +135,13 @@
     });
   }
 
-  /* --- PDF: pdf.js text items grouped into lines by position,
-         then lines joined into paragraphs by vertical spacing,
-         so wrapped lines merge the way MarkItDown never did. */
+  /* --- PDF: pdf.js text items grouped into lines by position.
+         Items are joined into words by their actual horizontal
+         gaps, so words the PDF split into fragments come back
+         together and punctuation reattaches. Lines that repeat
+         on most pages (signature stamps, running footers) are
+         dropped. Remaining lines become paragraphs (adaptive
+         joining) and simple tables (geometric detection). */
   function convertPdf(file) {
     return loadScript('pdf.min.js').then(function () {
       pdfjsLib.GlobalWorkerOptions.workerSrc = VENDOR + 'pdf.worker.min.js';
@@ -145,7 +149,7 @@
     }).then(function (buf) {
       return pdfjsLib.getDocument({ data: buf }).promise;
     }).then(function (pdf) {
-      var pages = [];
+      var pageLines = [];
       var chain = Promise.resolve();
       for (var p = 1; p <= pdf.numPages; p++) {
         (function (pageNum) {
@@ -154,14 +158,39 @@
           }).then(function (page) {
             return page.getTextContent();
           }).then(function (tc) {
-            pages.push(pdfPageToMarkdown(tc.items));
+            pageLines.push(pdfExtractLines(tc.items));
           });
         })(p);
       }
-      return chain.then(function () { return pages.join('\n\n').trim(); });
+      return chain.then(function () {
+        pdfDropBoilerplate(pageLines);
+        var pagesMd = pageLines.map(pdfLinesToBlocks).filter(function (md) { return md; });
+        /* A paragraph that continues over a page break arrives as
+           two blocks; rejoin it when the first ends mid-sentence
+           and the next opens with a lowercase letter. */
+        var merged = [];
+        pagesMd.forEach(function (md) {
+          if (!merged.length) { merged.push(md); return; }
+          var prev = merged[merged.length - 1];
+          var prevParas = prev.split('\n\n');
+          var nextParas = md.split('\n\n');
+          var lastBlock = prevParas[prevParas.length - 1];
+          var firstBlock = nextParas[0];
+          var midSentence = !/[.!?\u2026]["')]*$/.test(lastBlock) &&
+            lastBlock.charAt(0) !== '|' && !/^#/.test(lastBlock);
+          if (midSentence && /^[a-z]/.test(firstBlock)) {
+            prevParas[prevParas.length - 1] = lastBlock + ' ' + firstBlock;
+            merged[merged.length - 1] = prevParas.concat(nextParas.slice(1)).join('\n\n');
+          } else {
+            merged.push(md);
+          }
+        });
+        return merged.join('\n\n').trim();
+      });
     });
   }
-  function pdfPageToMarkdown(items) {
+
+  function pdfExtractLines(items) {
     var linesMap = new Map();
     items.forEach(function (item) {
       if (!item.str || !item.str.trim()) return;
@@ -177,40 +206,131 @@
     var lines = Array.from(linesMap.entries()).sort(function (a, b) { return b[0] - a[0]; })
       .map(function (entry) {
         var parts = entry[1].sort(function (a, b) { return a.x - b.x; });
+        var cells = pdfSplitCells(parts);
         return {
           y: entry[0],
           h: parts[0].h,
           x0: parts[0].x,
           x1: Math.max.apply(null, parts.map(function (p) { return p.end; })),
-          parts: parts,
-          cells: pdfSplitCells(parts),
-          text: parts.map(function (i) { return i.str; }).join(' ').replace(/\s+/g, ' ').trim()
+          cells: cells,
+          text: cells.map(function (c) { return c.text; }).join(' ')
         };
       }).filter(function (l) { return l.text; });
-    if (!lines.length) return '';
     lines.forEach(function (l) { l.w = Math.max(0, l.x1 - l.x0); });
+    return lines;
+  }
 
-    /* Split the page into text segments and tables. A run of at
-       least two lines whose items split into two or more cells at
-       wide horizontal gaps is a table candidate; the candidate
-       only becomes a table when its cells line up on shared
-       column anchors, so ordinary justified prose, whose word
-       gaps land at random positions, falls back to text. */
+  /* Join split fragments: a space is inserted only where the
+     horizontal gap says there is one. Producers that split words
+     into pieces leave gaps near zero; real spaces are several
+     points wide (or arrive as separate space items, which are
+     filtered out before this and leave their width as the gap). */
+  function pdfJoinParts(parts) {
+    var out = '';
+    var prevEnd = null;
+    parts.forEach(function (p) {
+      if (prevEnd !== null && p.x - prevEnd > 1.2) out += ' ';
+      out += p.str;
+      prevEnd = Math.max(prevEnd === null ? p.end : prevEnd, p.end);
+    });
+    return out.replace(/\s+/g, ' ').trim();
+  }
+
+  function pdfSplitCells(parts) {
+    var groups = [], cur = null;
+    parts.forEach(function (p) {
+      if (!cur) { cur = { x: p.x, end: p.end, parts: [p] }; return; }
+      var gap = p.x - cur.end;
+      if (gap > Math.max(12, (p.h || 10) * 1.05)) {
+        groups.push(cur);
+        cur = { x: p.x, end: p.end, parts: [p] };
+      } else {
+        cur.parts.push(p);
+        cur.end = Math.max(cur.end, p.end);
+      }
+    });
+    if (cur) groups.push(cur);
+    return groups.map(function (g) {
+      return { x: g.x, end: g.end, text: pdfJoinParts(g.parts) };
+    }).filter(function (c) { return c.text; });
+  }
+
+  /* Lines whose text shows up on most pages of the document are
+     stamps and running footers, not content. */
+  function pdfDropBoilerplate(pageLines) {
+    if (pageLines.length < 3) return;
+    var counts = new Map();
+    pageLines.forEach(function (lines) {
+      var seen = {};
+      lines.forEach(function (l) {
+        var norm = l.text.toLowerCase();
+        if (!seen[norm]) { seen[norm] = true; counts.set(norm, (counts.get(norm) || 0) + 1); }
+      });
+    });
+    var threshold = Math.max(3, Math.ceil(pageLines.length * 0.6));
+    pageLines.forEach(function (lines, idx) {
+      pageLines[idx] = lines.filter(function (l) {
+        return (counts.get(l.text.toLowerCase()) || 0) < threshold;
+      });
+    });
+  }
+
+  function pdfLinesToBlocks(lines) {
+    if (!lines.length) return '';
+    var pageText = lines.map(function (l) { return l.text; }).join('\n');
+    /* Split into text segments and table segments. Consecutive
+       multi-cell lines form a table segment while their column
+       anchors stay compatible; a form block followed by a real
+       table (different anchors) becomes two segments. */
     var blocks = [], textRun = [], i = 0;
     function flushText() {
       if (textRun.length) {
-        var md = pdfLinesToParagraphs(textRun);
+        var md = pdfLinesToParagraphs(textRun, pageText);
         if (md) blocks.push(md);
         textRun = [];
       }
     }
+    var pageWidths = lines.map(function (l) { return l.w; }).sort(function (a, b) { return a - b; });
+    var pageFullW = pageWidths.length ? pageWidths[Math.floor(pageWidths.length * 0.8)] : 0;
+    var pageLeft = Math.min.apply(null, lines.map(function (l) { return l.x0; }));
     while (i < lines.length) {
       if (lines[i].cells.length >= 2) {
-        var run = [];
-        while (i < lines.length && lines[i].cells.length >= 2) { run.push(lines[i]); i++; }
-        var table = pdfBuildTable(run);
-        if (table) { flushText(); blocks.push(table); }
-        else textRun = textRun.concat(run);
+        /* A table run starts at a multi-cell line. It continues
+           while lines carry cells on the run's column anchors,
+           including single-cell lines (fragments of wrapped
+           cells), and stops at full-width prose lines. */
+        var runLines = [lines[i]];
+        var runAnchors = [];
+        lines[i].cells.forEach(function (c) { runAnchors.push(c.x); });
+        i++;
+        while (i < lines.length) {
+          var cand = lines[i];
+          var onAnchor = cand.cells.some(function (c) {
+            return runAnchors.some(function (a) { return Math.abs(a - c.x) <= 8; });
+          });
+          /* Merged header lines carry disjoint column subsets, so
+             a multi-cell line packed tightly against the previous
+             one also belongs to the run, anchor match or not. */
+          var prevY = runLines[runLines.length - 1].y;
+          var tight = cand.cells.length >= 2 && (prevY - cand.y) > 0 &&
+            (prevY - cand.y) <= (cand.h || 12) * 1.8 + 4;
+          var isProse = cand.cells.length === 1 && pageFullW > 0 &&
+            cand.w > pageFullW * 0.6 && Math.abs(cand.x0 - pageLeft) <= 8;
+          if ((!onAnchor && !tight) || isProse) break;
+          runLines.push(cand);
+          cand.cells.forEach(function (c) {
+            if (!runAnchors.some(function (a) { return Math.abs(a - c.x) <= 8; })) runAnchors.push(c.x);
+          });
+          i++;
+        }
+        var segments = [runLines];
+        var placed = false;
+        segments.forEach(function (sg) {
+          var table = pdfBuildTable(sg);
+          if (table) { flushText(); blocks.push(table); placed = true; }
+          else textRun = textRun.concat(sg);
+        });
+        if (!placed) { /* all fell back to text */ }
       } else {
         textRun.push(lines[i]);
         i++;
@@ -220,28 +340,10 @@
     return blocks.join('\n\n');
   }
 
-  function pdfSplitCells(parts) {
-    var cells = [], cur = null;
-    parts.forEach(function (p) {
-      if (!cur) { cur = { x: p.x, end: p.end, text: p.str }; return; }
-      var gap = p.x - cur.end;
-      if (gap > Math.max(10, p.h || 10)) {
-        cells.push(cur);
-        cur = { x: p.x, end: p.end, text: p.str };
-      } else {
-        cur.text += ' ' + p.str;
-        cur.end = Math.max(cur.end, p.end);
-      }
-    });
-    if (cur) cells.push(cur);
-    cells.forEach(function (c) { c.text = c.text.replace(/\s+/g, ' ').trim(); });
-    return cells;
-  }
-
-  function pdfBuildTable(run) {
-    if (run.length < 2) return null;
+  function pdfBuildTable(seg) {
+    if (seg.length < 2) return null;
     var anchors = [];
-    run.forEach(function (line) {
+    seg.forEach(function (line) {
       line.cells.forEach(function (c) { anchors.push(c.x); });
     });
     anchors.sort(function (a, b) { return a - b; });
@@ -250,10 +352,8 @@
       if (!cols.length || x - cols[cols.length - 1] > 6) cols.push(x);
     });
     if (cols.length < 2 || cols.length > 12) return null;
-    /* Strong columns are anchors used by at least two rows. A real
-       table reuses its column starts; prose does not. */
     var colUse = cols.map(function () { return 0; });
-    run.forEach(function (line) {
+    seg.forEach(function (line) {
       var seen = {};
       line.cells.forEach(function (c) {
         var idx = pdfColumnIndex(cols, c.x);
@@ -261,31 +361,80 @@
       });
       Object.keys(seen).forEach(function (k) { colUse[Number(k)]++; });
     });
-    var strong = cols.filter(function (_, idx) { return colUse[idx] >= 2; });
-    if (strong.length < 2) return null;
-    var rowsOk = 0;
-    var grid = run.map(function (line) {
-      var row = strong.map(function () { return ''; });
-      var filled = {};
-      line.cells.forEach(function (c) {
-        var idx = pdfColumnIndex(strong, c.x);
-        if (idx < 0) idx = 0;
-        row[idx] = row[idx] ? row[idx] + ' ' + c.text : c.text;
-        filled[idx] = true;
+    var shared = colUse.filter(function (n) { return n >= 2; }).length;
+    if (shared < 2) return null;
+
+    /* Split the segment into chunks at wider vertical gaps
+       (header block vs body), then decide per chunk: sparse
+       chunks (most lines fill few columns) are one logical row
+       with wrapped cell text; dense chunks are a row per line. */
+    var gaps = [];
+    for (var gi = 1; gi < seg.length; gi++) {
+      var g = seg[gi - 1].y - seg[gi].y;
+      if (g > 0) gaps.push(g);
+    }
+    gaps.sort(function (a, b) { return a - b; });
+    var medGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+    var chunks = [[seg[0]]];
+    for (var li = 1; li < seg.length; li++) {
+      var gap = seg[li - 1].y - seg[li].y;
+      if (medGap > 0 && gap > medGap * 1.6) chunks.push([]);
+      chunks[chunks.length - 1].push(seg[li]);
+    }
+    var grid = [];
+    chunks.forEach(function (chunk) {
+      var fillTotal = 0;
+      chunk.forEach(function (line) {
+        var filled = {};
+        line.cells.forEach(function (c) {
+          var idx = pdfColumnIndex(cols, c.x);
+          if (idx >= 0) filled[idx] = true;
+        });
+        fillTotal += Object.keys(filled).length;
       });
-      if (Object.keys(filled).length >= 2) rowsOk++;
-      return row;
+      var avgFill = chunk.length ? (fillTotal / chunk.length) / cols.length : 1;
+      if (avgFill < 0.75 && chunk.length > 1) {
+        var row = cols.map(function () { return ''; });
+        chunk.forEach(function (line) {
+          line.cells.forEach(function (c) {
+            var idx = pdfColumnIndex(cols, c.x);
+            if (idx < 0) idx = 0;
+            row[idx] = row[idx] ? row[idx] + ' ' + c.text : c.text;
+          });
+        });
+        grid.push(row);
+      } else {
+        chunk.forEach(function (line) {
+          var row = cols.map(function () { return ''; });
+          line.cells.forEach(function (c) {
+            var idx = pdfColumnIndex(cols, c.x);
+            if (idx < 0) idx = 0;
+            row[idx] = row[idx] ? row[idx] + ' ' + c.text : c.text;
+          });
+          grid.push(row);
+        });
+      }
     });
-    if (rowsOk < Math.ceil(run.length * 0.7)) return null;
+    if (grid.length < 2) return null;
+    /* Drop columns that are empty in every row. */
+    var keep = cols.map(function (_, ci) {
+      return grid.some(function (row) { return row[ci]; });
+    });
+    if (keep.filter(Boolean).length < 2) return null;
+    grid = grid.map(function (row) {
+      return row.filter(function (_, ci) { return keep[ci]; });
+    });
     /* Two-column prose (journal layout) also aligns on anchors;
        its cells are long sentences, table cells are short. */
-    var words = 0, cellCount = 0;
-    grid.forEach(function (row) {
-      row.forEach(function (c) {
-        if (c) { words += c.split(/\s+/).length; cellCount++; }
+    if (grid[0].length === 2) {
+      var words = 0, cellCount = 0;
+      grid.forEach(function (row) {
+        row.forEach(function (c) {
+          if (c) { words += c.split(/\s+/).length; cellCount++; }
+        });
       });
-    });
-    if (strong.length === 2 && cellCount && words / cellCount > 6) return null;
+      if (cellCount && words / cellCount > 6) return null;
+    }
     return rowsToTable(grid);
   }
 
@@ -298,16 +447,15 @@
     return idx;
   }
 
-  function pdfLinesToParagraphs(lines) {
+  var PDF_LIST_START = /^\s*(\d{1,3}[.)]|\u2022|\u25aa|\u25cf)\s/;
+  function pdfLinesToParagraphs(lines, pageText) {
     /* Paragraph detection adapts to the document itself, because
        line spacing varies too much between PDF producers for one
-       fixed threshold. Signals, strongest first:
-       1. the font size changes (a heading starts),
-       2. the vertical gap is much larger than this segment's
-          typical line gap (the median of all gaps),
-       3. the previous line is short, so it ended a paragraph even
-          when the spacing is perfectly uniform,
-       4. this line starts indented, a first-line paragraph indent. */
+       fixed threshold. Signals: the font size changes, the gap
+       grows far beyond the segment's median line gap, the
+       previous line is short (it ended a paragraph), the next
+       line is indented (a first-line indent), or the next line
+       opens a numbered or bulleted list item. */
     var gaps = [];
     for (var i = 1; i < lines.length; i++) {
       var g = lines[i - 1].y - lines[i].y;
@@ -319,17 +467,31 @@
     var fullW = widths.length ? widths[Math.floor(widths.length * 0.8)] : 0;
     var leftEdge = Math.min.apply(null, lines.map(function (l) { return l.x0; }));
 
-    var paragraphs = [], current = '', paraH = 0, prevLine = null;
+    var paragraphs = [], current = '', paraH = 0, prevLine = null, paraIsList = false;
     lines.forEach(function (line) {
-      if (!current) { current = line.text; paraH = line.h; prevLine = line; return; }
+      if (!current) {
+        current = line.text; paraH = line.h; prevLine = line;
+        paraIsList = PDF_LIST_START.test(line.text);
+        return;
+      }
       var gap = prevLine.y - line.y;
       var fontChanged = paraH > 0 && Math.abs(line.h - paraH) / paraH > 0.3;
       var gapBreak = medGap > 0 && gap > medGap * 1.4;
       var shortBreak = fullW > 0 && prevLine.w < fullW * 0.82 && line.x0 <= leftEdge + fullW * 0.08;
       var indentBreak = fullW > 0 && (line.x0 - prevLine.x0) > fullW * 0.04 && (line.x0 - prevLine.x0) < fullW * 0.3;
-      if (!fontChanged && !gapBreak && !shortBreak && !indentBreak) {
-        if (/[A-Za-z]-$/.test(current) && /^[a-z]/.test(line.text)) {
-          current = current.slice(0, -1) + line.text;
+      var listBreak = PDF_LIST_START.test(line.text);
+      /* A list item whose last line ends mid-sentence continues
+         on the next line, whatever the spacing says. */
+      var listContinuation = paraIsList && !/[.!?]["')]*$/.test(current);
+      if (!fontChanged && !listBreak && (listContinuation || (!gapBreak && !shortBreak && !indentBreak))) {
+        var hyph = current.match(/([A-Za-z]+)-$/);
+        if (hyph && /^[a-z]/.test(line.text)) {
+          var fragB = (line.text.match(/^[A-Za-z]+/) || [''])[0];
+          if (pageText && pageText.indexOf(hyph[1] + '-' + fragB) >= 0) {
+            current += line.text;
+          } else {
+            current = current.slice(0, -1) + line.text;
+          }
         } else {
           current += ' ' + line.text;
         }
@@ -337,6 +499,7 @@
         paragraphs.push(current);
         current = line.text;
         paraH = line.h;
+        paraIsList = PDF_LIST_START.test(line.text);
       }
       prevLine = line;
     });
